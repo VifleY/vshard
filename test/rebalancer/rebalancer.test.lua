@@ -133,10 +133,6 @@ wait_rebalancer_state("Rebalancer is disabled", test_run)
 -- (See point (6) in the test plan)
 --
 vshard.storage.rebalancer_enable()
-_bucket:update({150}, {{'=', 2, vshard.consts.BUCKET.RECEIVING}})
-wait_rebalancer_state("Some buckets are not active", test_run)
-_bucket:update({150}, {{'=', 2, vshard.consts.BUCKET.ACTIVE}})
-
 --
 -- Test garbage collector deletes sent buckets and their data.
 -- (See point (7) in the test plan)

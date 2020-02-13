@@ -1834,7 +1834,6 @@ local function rebalancer_apply_routes(routes)
     if is_this_replicaset_locked() then
         return false, lerror.vshard(lerror.code.REPLICASET_IS_LOCKED);
     end
-    assert(not rebalancing_is_in_progress())
     -- Can not apply routes here because of gh-946 in tarantool
     -- about problems with long polling. Apply routes in a fiber.
     lfiber.create(rebalancer_apply_routes_f, routes)
@@ -1851,7 +1850,7 @@ end
 local function rebalancer_download_states()
     local replicasets = {}
     local total_bucket_locked_count = 0
-    local total_bucket_active_count = 0
+    local total_bucket_nonlocked_count = 0
     for uuid, replicaset in pairs(M.replicasets) do
         local state =
             replicaset:callrw('vshard.storage.rebalancer_request_state', {})
@@ -1859,19 +1858,22 @@ local function rebalancer_download_states()
             return
         end
         local bucket_count = state.bucket_active_count +
-                             state.bucket_pinned_count
+                             state.bucket_pinned_count +
+                             state.bucket_transferring_count
+
         if replicaset.lock then
             total_bucket_locked_count = total_bucket_locked_count + bucket_count
         else
-            total_bucket_active_count = total_bucket_active_count + bucket_count
+            total_bucket_nonlocked_count = total_bucket_nonlocked_count + bucket_count
             replicasets[uuid] = {bucket_count = bucket_count,
+                                 bucket_transferring_count = state.bucket_transferring_count,
                                  weight = replicaset.weight,
                                  pinned_count = state.bucket_pinned_count}
         end
     end
-    local sum = total_bucket_active_count + total_bucket_locked_count
+    local sum = total_bucket_nonlocked_count + total_bucket_locked_count
     if sum == M.total_bucket_count then
-        return replicasets, total_bucket_active_count
+        return replicasets, total_bucket_nonlocked_count
     else
         log.info('Total active bucket count is not equal to total. '..
                  'Possibly a boostrap is not finished yet. Expected %d, but '..
@@ -1890,7 +1892,7 @@ local function rebalancer_f()
             log.info('Rebalancer is disabled. Sleep')
             lfiber.sleep(consts.REBALANCER_IDLE_INTERVAL)
         end
-        local status, replicasets, total_bucket_active_count =
+        local status, replicasets, total_bucket_count =
             pcall(rebalancer_download_states)
         if M.module_version ~= module_version then
             return
@@ -1905,7 +1907,7 @@ local function rebalancer_f()
             goto continue
         end
         lreplicaset.calculate_etalon_balance(replicasets,
-                                             total_bucket_active_count)
+                                             total_bucket_count)
         local max_disbalance, max_disbalance_uuid =
             rebalancer_calculate_metrics(replicasets)
         local threshold = M.rebalancer_disbalance_threshold
@@ -1927,7 +1929,16 @@ local function rebalancer_f()
             lfiber.sleep(consts.REBALANCER_IDLE_INTERVAL)
             goto continue
         end
-        local routes = rebalancer_build_routes(replicasets)
+
+         
+        local non_transferring_replicasets = {}
+        for rs_uuid, rs in pairs(replicasets) do
+            if rs.bucket_transferring_count == 0 then
+                non_transferring_replicasets[rs_uuid] = rs
+            end
+        end
+
+        local routes = rebalancer_build_routes(non_transferring_replicasets)
         -- Routes table can not be empty. If it had been empty,
         -- then max_disbalance would have been calculated
         -- incorrectly.
@@ -1958,22 +1969,22 @@ end
 -- @retval     nil Not SENT or not ACTIVE buckets were found.
 --
 local function rebalancer_request_state()
-    if not M.is_rebalancer_active or rebalancing_is_in_progress() then
+    if not M.is_rebalancer_active then
         return
     end
     local _bucket = box.space._bucket
     local status_index = _bucket.index.status
-    if #status_index:select({consts.BUCKET.SENDING}, {limit = 1}) > 0 then
-        return
-    end
-    if #status_index:select({consts.BUCKET.RECEIVING}, {limit = 1}) > 0 then
-        return
-    end
-    if #status_index:select({consts.BUCKET.GARBAGE}, {limit = 1}) > 0 then
-        return
-    end
-    local bucket_count = _bucket:count()
+
+    local buckets_sent_count = status_index:count({consts.BUCKET.SENT})
+    local buckets_sending_count = status_index:count({consts.BUCKET.SENDING})
+    local buckets_receiving_count = status_index:count({consts.BUCKET.RECEIVING})
+
+    local bucket_transferring_count = buckets_sent_count +
+                                      buckets_sending_count +
+                                      buckets_receiving_count
+
     return {
+        bucket_transferring_count = bucket_transferring_count,
         bucket_active_count = status_index:count({consts.BUCKET.ACTIVE}),
         bucket_pinned_count = status_index:count({consts.BUCKET.PINNED}),
     }
